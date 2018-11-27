@@ -1,7 +1,13 @@
+from matcom.tools.edge_calculators import sub_pairwise_squared_distance
+
 from dataspace.base import Pipe, in_batches
 from dataspace.workspaces.local_db import MongoFrame
 
-from matcom.tools.edge_calculators import sub_pairwise_squared_distance
+from pymatgen.core import Structure
+from pymatgen.analysis.defects.generators import VacancyGenerator
+
+from matminer.featurizers.site import CrystalNNFingerprint
+from matminer.featurizers.structure import SiteStatsFingerprint
 
 from pandas import DataFrame
 
@@ -10,44 +16,56 @@ this module implements a pipeline for constructing graphs from feature spaces
 '''
 
 
+FRAMEWORK_FEATURIZER = SiteStatsFingerprint(
+    site_featurizer=CrystalNNFingerprint.from_preset(
+        preset="ops", distance_cutoffs=None, x_diff_weight=0.0,
+        porous_adjustment=False),
+    stats=['mean', 'std_dev', 'maximum', 'minimum'])
+
+
 class ConstructStructureGraph(Pipe):
     '''
     structures (verticies) within a similarity threshold are connected by edges
     to form a graph of the structure space. additional edges connect structures
     that are similar to another when a defect (strain/vacancy/interstical) is
     introduced to one of the structures (e.g. rocksalt + intersticial = BCC)
+
+    the graph is stored as an adjacency list to conserve storage/memory
     '''
     def __init__(self, structure_space, graph_space):
         '''
         Args:
             structure_space (MongoFrame) workspace with structure_features
-            graph_space (MongoFrame) workspace holding verticies and edges
+            graph_space (MongoFrame) workspace to hold verticies and edges
         '''
         Pipe.__init__(self, source=structure_space, destination=graph_space)
 
-    def populate_verticies(self):
+    def populate_verticies(self,
+                           criteria={'structure_features': {'$exists': True},
+                                     'nsites': {'$lte': 51}}):
         '''
         populate verticies in graph space with verticies from structure space
         '''
-        self.source.from_storage(find={'filter':
-                                       {'structure_features':
-                                        {'$exists': True}},
-                                       'projection':
-                                       {'material_id': 1}})
+        self.source.from_storage(find={'filter': criteria,
+                                       'projection': {'material_id': 1}})
         self.transfer(to='destination')
         self.destination.to_storage(identifier='material_id', upsert=True)
 
     @in_batches
-    def find_edges(self, threshold=0.5, batch_size=10000):
+    def find_edges(self, threshold=0.5, batch_size=10000,
+                   edge_calculator=sub_pairwise_squared_distance):
         '''
-        solve for undirected edges connected to nodes in the structure space.
-        jit compiling is essential for speed, since numpy broadcasting
-        consumes too much memory for practical implementation
+        solve for undirected, boolean edges in the structure space. the graph
+        structure is stored as an adjacency list using this document schema:
+            'material_id' : str : the source vertex
+            'edges' : list of str : the destination verticies
 
         Args:
             threshold (float) distance threshold to connect an edge
             batch_size (int) batch size for computing pairwise distances when
                 generating graph edges. subject to memory constraints
+            edge_calculator (func) a sub-pairwise distance calculator that
+                returns an N x M adjacency matrix
         '''
 
         # load material ids without defined edges
@@ -87,8 +105,7 @@ class ConstructStructureGraph(Pipe):
             self.source.memory = None  # cleanup memory
 
             # determine edge matrix
-            edge_matrix = sub_pairwise_squared_distance(
-                all_vectors, sub_vectors, threshold)
+            edge_matrix = edge_calculator(all_vectors, sub_vectors, threshold)
 
             # store edges in graph space
             adjacency_list = {}
@@ -102,14 +119,74 @@ class ConstructStructureGraph(Pipe):
 
             return 1  # return True to continue the update
 
-    def find_vacancy_edges(self):
+    def add_vacancy_edges(self, threshold=0.5, batch_size=10000,
+                          edge_calculator=sub_pairwise_squared_distance,
+                          featurizer=FRAMEWORK_FEATURIZER):
         '''
-        induce vacancy structures to find edges
+        add vacancy induced edges to the adjacency list
+
+        Args:
+            threshold (float) distance threshold to connect an edge
+            batch_size (int) batch size for computing pairwise distances when
+                generating graph edges. subject to memory constraints
+            edge_calculator (func) a sub-pairwise distance calculator that
+                returns an N x M adjacency matrix
         '''
-        pass
+
+        # retrieve structure features from structure space
+        self.source.from_storage(find={'filter':
+                                       {'structure_features':
+                                        {'$exists': True}},
+                                       'projection':
+                                       {'material_id': 1,
+                                        'structure_features': 1,
+                                        'structure': 1,
+                                        '_id': 0}})
+        self.source.compress_memory(column='structure_features',
+                                    decompress=True)
+        self.source.memory.set_index('material_id', inplace=True)
+
+        # construct the numpy representation of the data
+        ids = self.source.memory.index.values
+        structures = self.source.memory['structure'].values
+        self.source.memory.drop(labels='structure', axis=1, inplace=True)
+        all_vectors = self.source.memory.values
+        vector_labels = self.source.memory.colums.values
+        self.source.memory = None
+
+        # calculate edges for each possible vacancy structure
+        for i, structure in enumerate(structures):
+
+            # generate vacancy structure features
+            base_structure = Structure.from_dict(structure)
+            vacancies = [i.generate_defect_structure(supercell=(1, 1, 1))
+                         for i in VacancyGenerator(base_structure)]
+            sub_vectors = DataFrame(data={'structure': vacancies})
+            featurizer.featurize_dataframe(sub_vectors, 'structure',
+                                           ignore_errors=True, pbar=False)
+
+            # establish same column order for edge calculation
+            sub_vectors = sub_vectors[vector_labels]
+            sub_vectors = sub_vectors.values
+            edge_matrix = edge_calculator(all_vectors, sub_vectors, threshold)
+            edge_mask = edge_matrix.sum(axis=1).astype(bool)
+            vacancy_edges = ids[edge_mask]
+
+            # update the adjacency list
+            self.destination.from_storage(find={'filter':
+                                                {'material_id': ids[i]},
+                                                'projection':
+                                                {'material_id': 1,
+                                                 'edges': 1,
+                                                 '_id': 0}})
+            self.destination.memory.at[self.destination.memory.index[0],
+                                       'edges'] = vacancy_edges
+
+            self.destination.to_storage(identifier='material_id')
 
 
 if __name__ == '__main__':
+    import numpy as np
 
     PATH = '/home/mdylla/repos/code/orbital_phase_diagrams/local_db'
     DATABASE = 'orbital_phase_diagrams'
@@ -125,11 +202,15 @@ if __name__ == '__main__':
     # pipe.find_edges()
     # print('calculated edges')
 
-    graph_space.from_storage(find={'projection': {'material_id': 1,
-                                                  'edges': 1,
-                                                  '_id': 0},
-                                   'limit': 0})
-    print(graph_space.memory)
+    a = np.array([0, 1, 2])
+    print(a)
+    print(a.astype(bool))
+
+    # graph_space.from_storage(find={'projection': {'material_id': 1,
+    #                                               'edges': 1,
+    #                                               '_id': 0},
+    #                                'limit': 0})
+    # print(graph_space.memory)
 
     # data.from_storage(find={'filter':
     #                         {'structure_features': {'$exists': True}},
