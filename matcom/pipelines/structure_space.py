@@ -47,11 +47,11 @@ class GenerateStructureSpace(Pipe):
         self.update_structures(batchsize=batch_size)
         self.featurize_structures(batch_size=batch_size, featurizer=featurizer)
 
-    def update_mp_ids(self):
+    def update_mp_ids(self, criteria={'structure': {'$exists': True}}):
         '''
         update the collection of mp ids in the local database
         '''
-        self.source.from_storage(criteria={'structure': {'$exists': True}},
+        self.source.from_storage(criteria=criteria,
                                  properties=['material_id'],
                                  index_mpid=False)
         self.transfer(to='destination')
@@ -144,15 +144,16 @@ class GenerateStructureSpace(Pipe):
 
 
 if __name__ == '__main__':
-    from sklearn.pipeline import Pipeline
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.decomposition import PCA
+    # from sklearn.pipeline import Pipeline
+    # from sklearn.preprocessing import StandardScaler
+    # from sklearn.decomposition import PCA
+    import matplotlib.pyplot as plt
 
     # 0. user fields
-    # PATH = '/home/mdylla/repos/code/orbital_phase_diagrams/local_db'
-    # DATABASE = 'orbital_phase_diagrams'
-    # COLLECTION = 'structure'
-    # API_KEY = 'VerGNDXO3Wdt4cJb'
+    PATH = '/home/mdylla/repos/code/orbital_phase_diagrams/local_db'
+    DATABASE = 'orbital_phase_diagrams'
+    COLLECTION = 'structure'
+    API_KEY = 'VerGNDXO3Wdt4cJb'
 
     # 1. generate structure space
     # gen = GenerateStructureSpace(PATH, DATABASE, COLLECTION, API_KEY)
@@ -168,3 +169,20 @@ if __name__ == '__main__':
     #                          '_id': 0}})
     # data.compress_memory(column='structure_features', decompress=True)
     # data.memory.set_index('material_id', inplace=True)
+
+    # 3. check nsites distribution
+    data = MongoFrame(PATH, DATABASE, COLLECTION)
+    data.from_storage(find={'filter':
+                            {'structure_features': {'$exists': True}},
+                            'projection':
+                            {'material_id': 1,
+                             'nsites': 1,
+                             '_id': 0}})
+    data.memory.set_index('material_id', inplace=True)
+
+    plt.hist(data.memory['nsites'].values, bins=50)
+    # plt.ylim(0, 3000)
+    plt.xlim(0, 100)
+    plt.show()
+
+
