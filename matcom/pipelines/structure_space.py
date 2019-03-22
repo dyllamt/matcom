@@ -1,11 +1,12 @@
 from dataspace.base import Pipe, in_batches
-from dataspace.workspaces.materials_api import MPFrame
+from dataspace.workspaces.materials_api import APIFrame
 from dataspace.workspaces.local_db import MongoFrame
 
 from pandas import concat
 
 from pymatgen.core.structure import Structure
 
+from matminer.data_retrieval.retrieve_MP import MPDataRetrieval
 from matminer.featurizers.site import CrystalNNFingerprint
 from matminer.featurizers.structure import SiteStatsFingerprint
 
@@ -21,13 +22,14 @@ FRAMEWORK_FEATURIZER = SiteStatsFingerprint(
     stats=['mean', 'std_dev', 'maximum', 'minimum'])
 
 
-class GenerateStructureSpace(Pipe):
+class GenerateStructureCollection(Pipe):
     '''
     structure data is collected from the materials project and deposited in a
     local mongodb. structures in the local db are featurized with matminer.
     feature vectors are stored as dictionaries in the structure_features field
     '''
-    def __init__(self, path, database, collection, api_key=None):
+    def __init__(self, path='/data/db', database='structure_graphs',
+                 collection='structure', api_key=None):
         '''
         Args:
             path (str) path to a local mongodb directory
@@ -35,9 +37,11 @@ class GenerateStructureSpace(Pipe):
             collection (str) name of a pymongo collection
             api_key (str) materials project api key
         '''
-        self.source = MPFrame(api_key=api_key)
-        self.destination = MongoFrame(path=path, database=database,
-                                      collection=collection)
+        mp_retriever = APIFrame(
+            RetrievalSubClass=MPDataRetrieval, api_key=api_key)
+        structure_space = MongoFrame(
+            path=path, database=database, collection=collection)
+        Pipe.__init__(self, source=mp_retriever, destination=structure_space)
 
     def update_all(self, batch_size=500, featurizer=FRAMEWORK_FEATURIZER):
         '''
@@ -45,7 +49,8 @@ class GenerateStructureSpace(Pipe):
         '''
         self.update_mp_ids()
         self.update_structures(batchsize=batch_size)
-        self.featurize_structures(batch_size=batch_size, featurizer=featurizer)
+        self.update_structure_features(
+            batch_size=batch_size, featurizer=featurizer)
 
     def update_mp_ids(self, criteria={'structure': {'$exists': True}}):
         '''
@@ -68,12 +73,10 @@ class GenerateStructureSpace(Pipe):
         '''
 
         # load material ids without structure to memory
-        self.destination.from_storage(find={'filter':
-                                            {'structure':
-                                             {'$exists': False}},
-                                            'projection':
-                                            {'material_id': 1},
-                                            'limit': batch_size})
+        self.destination.from_storage(
+            filter={'structure': {'$exists': False}},
+            projection={'material_id': 1},
+            limit=batch_size)
 
         if len(self.destination.memory.index) == 0:
 
@@ -97,8 +100,8 @@ class GenerateStructureSpace(Pipe):
             return 1  # return True to continue update
 
     @in_batches
-    def featurize_structures(self, batch_size=500,
-                             featurizer=FRAMEWORK_FEATURIZER):
+    def update_structure_features(self, batch_size=500,
+                                  featurizer=FRAMEWORK_FEATURIZER):
         '''
         featurize structures in the local database in batches
 
@@ -109,12 +112,12 @@ class GenerateStructureSpace(Pipe):
 
         # load structures that are not featurized from storage
         self.destination.from_storage(
-            find={'filter': {'structure': {'$exists': True},
-                  'structure_features': {'$exists': False}},
-                  'projection': {'material_id': 1,
-                                 'structure': 1,
-                                 '_id': 0},
-                  'limit': batch_size})
+            filter={'structure': {'$exists': True},
+                    'structure_features': {'$exists': False}},
+            projection={'material_id': 1,
+                        'structure': 1,
+                        '_id': 0},
+            limit=batch_size)
 
         if len(self.destination.memory.index) == 0:
 
@@ -144,45 +147,6 @@ class GenerateStructureSpace(Pipe):
 
 
 if __name__ == '__main__':
-    # from sklearn.pipeline import Pipeline
-    # from sklearn.preprocessing import StandardScaler
-    # from sklearn.decomposition import PCA
-    import matplotlib.pyplot as plt
 
-    # 0. user fields
-    PATH = '/home/mdylla/repos/code/orbital_phase_diagrams/local_db'
-    DATABASE = 'orbital_phase_diagrams'
-    COLLECTION = 'structure'
-    API_KEY = 'VerGNDXO3Wdt4cJb'
-
-    # 1. generate structure space
-    # gen = GenerateStructureSpace(PATH, DATABASE, COLLECTION, API_KEY)
-    # gen.update_all()
-
-    # 2. visualize structure space
-    # data = MongoFrame(PATH, DATABASE, COLLECTION)
-    # data.from_storage(find={'filter':
-    #                         {'structure_features': {'$exists': True}},
-    #                         'projection':
-    #                         {'material_id': 1,
-    #                          'structure_features': 1,
-    #                          '_id': 0}})
-    # data.compress_memory(column='structure_features', decompress=True)
-    # data.memory.set_index('material_id', inplace=True)
-
-    # 3. check nsites distribution
-    data = MongoFrame(PATH, DATABASE, COLLECTION)
-    data.from_storage(find={'filter':
-                            {'structure_features': {'$exists': True}},
-                            'projection':
-                            {'material_id': 1,
-                             'nsites': 1,
-                             '_id': 0}})
-    data.memory.set_index('material_id', inplace=True)
-
-    plt.hist(data.memory['nsites'].values, bins=50)
-    # plt.ylim(0, 3000)
-    plt.xlim(0, 100)
-    plt.show()
-
-
+    gen = GenerateStructureCollection()
+    gen.update_all()
