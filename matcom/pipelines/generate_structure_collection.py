@@ -1,6 +1,6 @@
 from dataspace.base import Pipe, in_batches
 from dataspace.workspaces.materials_api import APIFrame
-from dataspace.workspaces.local_db import MongoFrame
+from dataspace.workspaces.remote_db import MongoFrame
 
 from pandas import concat
 
@@ -11,10 +11,13 @@ from matminer.featurizers.site import CrystalNNFingerprint
 from matminer.featurizers.structure import SiteStatsFingerprint
 
 '''
-this module implements a pipeline for generating structural feature vectors
+this module implements a pipeline for generating a mongo database of structures
+and their feature vectors from the materials project database. pipeline
+operations are implemented as instance methods
 '''
 
 
+# transformer for converting structures into feature vectors
 FRAMEWORK_FEATURIZER = SiteStatsFingerprint(
     site_featurizer=CrystalNNFingerprint.from_preset(
         preset="ops", distance_cutoffs=None, x_diff_weight=0.0,
@@ -24,37 +27,55 @@ FRAMEWORK_FEATURIZER = SiteStatsFingerprint(
 
 class GenerateStructureCollection(Pipe):
     '''
-    structure data is collected from the materials project and deposited in a
-    local mongodb. structures in the local db are featurized with matminer.
-    feature vectors are stored as dictionaries in the structure_features field
+    structures are collected from the materials project and deposited in a
+    mongodb collection under the document field "structure. these structures
+    are featurized using transformers from the matminer library. the feature
+    vectors are stored as dictionaries in the "structure_features" field of the
+    collection. the data is indexed by the document field "material_id"
+
+    Notes: document schema for the graph collection
+        material_id (str) the unique identifier for a material
+        structure (dict) representation of a pymatgen Structure
+        structure_features (dict) features describing the local coordination
+            enviornments in a given structure
+
+    Attributes:
+        source (APIFrame) a workspace which retrieves materials project data
+        destination (MongoFrame) a workspace which stores structure data
+
     '''
-    def __init__(self, path='/data/db', database='structure_graphs',
-                 collection='structure', api_key=None):
+    def __init__(self, host='localhost', port=27017,
+                 database='structure_graphs', collection='structure',
+                 api_key=None):
         '''
         Args:
-            path (str) path to a local mongodb directory
-            database (str) name of a pymongo database
-            collection (str) name of a pymongo collection
+            host (str) hostname or IP address or Unix domain socket path
+            port (int) port number on which to connect
+            database (str) storage database
+            collection (str) storage collection
             api_key (str) materials project api key
         '''
         mp_retriever = APIFrame(
             RetrievalSubClass=MPDataRetrieval, api_key=api_key)
         structure_space = MongoFrame(
-            path=path, database=database, collection=collection)
+            host=host, port=port, database=database, collection=collection)
         Pipe.__init__(self, source=mp_retriever, destination=structure_space)
 
-    def update_all(self, batch_size=500, featurizer=FRAMEWORK_FEATURIZER):
+    def update_material_ids(self, criteria={'structure': {'$exists': True}}):
         '''
-        convienience function for updating the structure space
-        '''
-        self.update_mp_ids()
-        self.update_structures(batchsize=batch_size)
-        self.update_structure_features(
-            batch_size=batch_size, featurizer=featurizer)
+        inserts documents in the mongodb collection based on a filter posted
+        against the materials project database
 
-    def update_mp_ids(self, criteria={'structure': {'$exists': True}}):
-        '''
-        update the collection of mp ids in the local database
+        Notes:
+            IO limited method
+
+        Args:
+            criteria (son) a pymongo-like filter to match against entries in
+                the materials project database. if an entry is a match, then
+                its corresponding "material_id" is retrieved from the database
+
+        DB operation:
+            upserts "material_id" fields on documents by "material_id"
         '''
         self.source.from_storage(criteria=criteria,
                                  properties=['material_id'],
@@ -65,17 +86,25 @@ class GenerateStructureCollection(Pipe):
     @in_batches
     def update_structures(self, batch_size=500):
         '''
-        update the collection of structures in the local database. updates are
-        done in batches to accomadate the api limits of the materials project
+        updates the document fields "structure", "formation_energy_per_atom",
+        "e_above_hull", and "nsites" for a list of documents indexed by the
+        "material_id" document field
+
+        Notes:
+            IO limited method
 
         Args:
             batch_size (int) limit on number of structures retrieved at a time
+
+        DB operation:
+            upserts "structure" fields on documents by "material_id"
         '''
 
-        # load material ids without structure to memory
+        # load materials without structures from storage
         self.destination.from_storage(
             filter={'structure': {'$exists': False}},
-            projection={'material_id': 1},
+            projection={'material_id': 1,
+                        '_id': 0},
             limit=batch_size)
 
         if len(self.destination.memory.index) == 0:
@@ -85,9 +114,9 @@ class GenerateStructureCollection(Pipe):
         else:
 
             # retrieve materials data from mp database
-            mp_ids = list(self.destination.memory['material_id'].values)
+            material_ids = list(self.destination.memory['material_id'])
             self.source.from_storage(
-                criteria={'material_id': {'$in': mp_ids}},
+                criteria={'material_id': {'$in': material_ids}},
                 properties=['material_id', 'structure',
                             'formation_energy_per_atom', 'e_above_hull',
                             'nsites'],
@@ -105,9 +134,15 @@ class GenerateStructureCollection(Pipe):
         '''
         featurize structures in the local database in batches
 
+        Notes:
+            Transformation limited method
+
         Args:
-            batch_size (int) limit on number of structures retrieved at a time
+            batch_size (int) limit on number of structures featurized at a time
             featurizer (BaseFeaturizer) an instance of a structural featurizer
+
+        DB operation:
+            upserts "structure_features" fields on documents by "material_id"
         '''
 
         # load structures that are not featurized from storage
@@ -149,4 +184,4 @@ class GenerateStructureCollection(Pipe):
 if __name__ == '__main__':
 
     gen = GenerateStructureCollection()
-    gen.update_all()
+    gen.update_material_ids()
