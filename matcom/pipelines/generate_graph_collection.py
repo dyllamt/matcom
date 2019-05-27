@@ -7,7 +7,7 @@ from matcom.pipelines.generate_structure_collection import FRAMEWORK_FEATURIZER
 from collections import defaultdict
 
 from dataspace.base import Pipe, in_batches
-from dataspace.workspaces.local_db import MongoFrame
+from dataspace.workspaces.remote_db import MongoFrame
 
 from pymatgen.core import Structure
 from pymatgen.analysis.defects.generators import VacancyGenerator
@@ -32,7 +32,8 @@ class GenerateGraphCollection(Pipe):
     Notes: document schema for the graph collection
         "material_id" (str) the source vertex
         "edges" (list of str) the destination verticies
-        "vacancy_edges" (list of str) the destination verticies
+        "vacancy_edges" (dict) the destination verticies for each symmetrically
+            inequivalant site (keys are site indicies, values are lists of str)
 
     Attributes:
         source (MongoFrame) a workspace which retrieves structural features
@@ -59,9 +60,33 @@ class GenerateGraphCollection(Pipe):
             collection=graph_collection)
         Pipe.__init__(self, source=structure_space, destination=graph_space)
 
+    def _load_structure_features(self):
+        '''
+        loads feature vectors into self.source.memory
+        '''
+        self.source.from_storage(filter={'structure_features':
+                                         {'$exists': True}},
+                                 projection={'material_id': 1,
+                                             'structure_features': 1,
+                                             '_id': 0})
+        self.source.compress_memory(column='structure_features',
+                                    decompress=True)
+        self.source.memory.set_index('material_id', inplace=True)
+
+    def _load_structures(self, material_ids):
+        '''
+        loads structures into self.source.memory
+        '''
+        self.source.from_storage(filter={'material_id':
+                                         {'$in': material_ids}},
+                                 projection={'material_id': 1,
+                                             'structure': 1,
+                                             '_id': 0})
+        self.source.memory.set_index('material_id', inplace=True)
+        self.source.memory = self.source.memory.loc[material_ids]
+
     def update_verticies(self,
-                         criteria={'structure_features': {'$exists': True},
-                                   'nsites': {'$lte': 51}}):
+                         criteria={'structure_features': {'$exists': True}}):
         '''
         populate verticies in graph space with verticies from structure space
 
@@ -137,7 +162,7 @@ class GenerateGraphCollection(Pipe):
         solve for directed, boolean edges based on similarity with a vacancy
 
         Notes:
-            Transformation limited method
+            Transformation limited method (featurization of vacancy structures)
 
         Args:
             threshold (float) distance threshold to connect an edge
@@ -152,8 +177,7 @@ class GenerateGraphCollection(Pipe):
         self.destination.from_storage(
             filter={'vacancy_edges':
                     {'$exists': False}},
-            projection={'material_id': 1,
-                        'structure': 1},
+            projection={'material_id': 1},
             limit=batch_size)
 
         if len(self.destination.memory.index) == 0:
@@ -162,9 +186,8 @@ class GenerateGraphCollection(Pipe):
 
         else:
 
-            # gets the source vertex ids and structures for the current batch
+            # gets the source vertex ids for the current batch
             source_ids = self.destination.memory['material_id'].values
-            source_structures = self.destination.memory['structure'].values
             self.destination.memory = None  # cleanup memory
 
             # gets the potential destination vertex ids and their features
@@ -176,22 +199,27 @@ class GenerateGraphCollection(Pipe):
             self.source.memory = None  # cleanup memory
 
             # calculates feature vectors for each (source) vacancy structure
+            self._load_structures(list(source_ids))
+            source_structures = self.source.memory['structure'].values
+            self.source.memory = None  # cleanup memory
+
             vacancy_structures = []
             for material_id, structure in zip(source_ids, source_structures):
                 structure = Structure.from_dict(structure)
                 for site_i, vacancy in enumerate(VacancyGenerator(structure)):
                     vacancies = [
                         material_id,
-                        site_i,
+                        str(site_i),
                         vacancy.generate_defect_structure(supercell=(1, 1, 1))
                     ]
                     vacancy_structures.append(vacancies)
             vacancy_structures = DataFrame(
                 data=vacancy_structures,
-                columns=['source_id', 'site_index' 'structure'])
+                columns=['source_id', 'site_index', 'structure'])
+
             vacancy_vectors = featurizer.featurize_dataframe(
-                vacancy_structures, 'structure', ignore_errors=True, pbar=False
-            )[vector_labels].values
+                vacancy_structures, 'structure', ignore_errors=True,
+                pbar=False, inplace=False)[vector_labels].values
 
             # determine edge matrix and coresponding adjacency list
             edge_matrix = edge_calculator(
@@ -204,33 +232,18 @@ class GenerateGraphCollection(Pipe):
                     all_ids[edge_matrix[:, j]])
 
             # store edges in graph space
-            self.destination.memory = DataFrame.from_dict(
-                adjacency_list, orient='index').reset_index().rename(
-                    columns={'index': 'material_id'})
-            print(self.destination.memory)
-            raise ValueError
+            self.destination.memory = DataFrame.from_records(
+                list(adjacency_list.items()),
+                columns=['material_id', 'vacancy_edges'])
             self.destination.to_storage(identifier='material_id')
 
             return 1  # return True to continue the update
-
-        def _load_structure_features(self):
-            '''
-            loads feature vectors into self.source.memory
-            '''
-            self.source.from_storage(filter={'structure_features':
-                                             {'$exists': True}},
-                                     projection={'material_id': 1,
-                                                 'structure_features': 1,
-                                                 '_id': 0})
-            self.source.compress_memory(column='structure_features',
-                                        decompress=True)
-            self.source.memory.set_index('material_id', inplace=True)
 
 
 if __name__ == '__main__':
 
     gen = GenerateGraphCollection()
-    gen.source.from_storage(
-        projection=['material_id'])
-    print(gen.source.memory)
+    # gen.destination.delete_storage(clear_collection=True)
+    # gen.update_verticies()
+    # gen.update_edges()
     # gen.update_vacancy_edges()

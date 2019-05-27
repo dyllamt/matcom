@@ -28,7 +28,7 @@ FRAMEWORK_FEATURIZER = SiteStatsFingerprint(
 class GenerateStructureCollection(Pipe):
     '''
     structures are collected from the materials project and deposited in a
-    mongodb collection under the document field "structure. these structures
+    mongodb collection under the document field "structure". these structures
     are featurized using transformers from the matminer library. the feature
     vectors are stored as dictionaries in the "structure_features" field of the
     collection. the data is indexed by the document field "material_id"
@@ -42,7 +42,6 @@ class GenerateStructureCollection(Pipe):
     Attributes:
         source (APIFrame) a workspace which retrieves materials project data
         destination (MongoFrame) a workspace which stores structure data
-
     '''
     def __init__(self, host='localhost', port=27017,
                  database='structure_graphs', collection='structure',
@@ -61,7 +60,9 @@ class GenerateStructureCollection(Pipe):
             host=host, port=port, database=database, collection=collection)
         Pipe.__init__(self, source=mp_retriever, destination=structure_space)
 
-    def update_material_ids(self, criteria={'structure': {'$exists': True}}):
+    def update_material_ids(self, criteria={'structure': {'$exists': True},
+                                            'nsites': {'$lte': 50}},
+                            initial_collection=False):
         '''
         inserts documents in the mongodb collection based on a filter posted
         against the materials project database
@@ -73,6 +74,8 @@ class GenerateStructureCollection(Pipe):
             criteria (son) a pymongo-like filter to match against entries in
                 the materials project database. if an entry is a match, then
                 its corresponding "material_id" is retrieved from the database
+            initial_collection (bool) set to true if this is the initial
+                collection of ids (i.e. will perform non-unique insertion)
 
         DB operation:
             upserts "material_id" fields on documents by "material_id"
@@ -81,14 +84,17 @@ class GenerateStructureCollection(Pipe):
                                  properties=['material_id'],
                                  index_mpid=False)
         self.transfer(to='destination')
-        self.destination.to_storage(identifier='material_id', upsert=True)
+
+        if initial_collection:  # performs non-unique insertion
+            identifier = None
+        else:  # will check if material_id is already in collection
+            identifier = 'material_id'
+        self.destination.to_storage(identifier=identifier, upsert=True)
 
     @in_batches
     def update_structures(self, batch_size=500):
         '''
-        updates the document fields "structure", "formation_energy_per_atom",
-        "e_above_hull", and "nsites" for a list of documents indexed by the
-        "material_id" document field
+        collects structures for all documents missing a "structure" field
 
         Notes:
             IO limited method
@@ -97,7 +103,8 @@ class GenerateStructureCollection(Pipe):
             batch_size (int) limit on number of structures retrieved at a time
 
         DB operation:
-            upserts "structure" fields on documents by "material_id"
+            upserts "structure", "formation_energy_per_atom", "e_above_hull",
+            and "nsites" fields on documents by "material_id"
         '''
 
         # load materials without structures from storage
@@ -122,6 +129,10 @@ class GenerateStructureCollection(Pipe):
                             'nsites'],
                 index_mpid=False)
 
+            # converts pymatgen Structure objects into dictionaries
+            self.source.memory['structure'] = [
+                i.as_dict() for i in self.source.memory['structure']]
+
             # save materials data to local storage
             self.transfer(to='destination')
             self.destination.to_storage(identifier='material_id', upsert=True)
@@ -132,10 +143,11 @@ class GenerateStructureCollection(Pipe):
     def update_structure_features(self, batch_size=500,
                                   featurizer=FRAMEWORK_FEATURIZER):
         '''
-        featurize structures in the local database in batches
+        computes feature vectors for all documents missing the
+        "structure_features" document field
 
         Notes:
-            Transformation limited method
+            Transformation limited method (featurization step)
 
         Args:
             batch_size (int) limit on number of structures featurized at a time
@@ -167,7 +179,7 @@ class GenerateStructureCollection(Pipe):
             featurizer.featurize_dataframe(self.destination.memory,
                                            'structure',
                                            ignore_errors=True,
-                                           pbar=False)
+                                           pbar=False, inplace=True)
 
             # store compressed features in permanant storage
             mp_ids = self.destination.memory[['material_id']]
@@ -184,4 +196,7 @@ class GenerateStructureCollection(Pipe):
 if __name__ == '__main__':
 
     gen = GenerateStructureCollection()
-    gen.update_material_ids()
+    # gen.destination.delete_storage(clear_collection=True)
+    # gen.update_material_ids(initial_collection=True)
+    # gen.update_structures()
+    # gen.update_structure_features()
